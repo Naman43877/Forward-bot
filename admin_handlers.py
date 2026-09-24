@@ -150,6 +150,50 @@ async def channels(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 @auth.admin_only
+async def links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Every configured URL, laid out by group, so an import or a campaign
+    change can be eyeballed rather than trusted."""
+    a = _args(update)
+    groups = db.list_groups()
+    if a:
+        g = db.get_group_by_name(a[0])
+        if not g:
+            existing = [x["name"] for x in groups]
+            await update.effective_message.reply_text(
+                f"No group called '{a[0]}'.\n\n"
+                + (f"Existing: {', '.join(existing)}" if existing else "No groups yet."))
+            return
+        groups = [g]
+
+    if not groups:
+        await update.effective_message.reply_text("No groups yet.")
+        return
+
+    blocks = []
+    for g in groups:
+        rows = []
+        for c in db.channels_in_group(g["group_id"]):
+            aff = (f"   ↳ [{c['affiliate_text']}] {c['affiliate_url']}"
+                   if c["affiliate_url"] else "   ↳ ⚠️ no affiliate link")
+            dm = (f"   ↳ [{c['dm_text']}] {c['dm_url']}"
+                  if c["dm_url"] else "   ↳ ⚠️ no DM link")
+            rows.append(f"• {c['title']}  ({c['chat_id']})\n{aff}\n{dm}")
+        blocks.append(f"━━ {g['name']} ━━\n"
+                      + ("\n".join(rows) if rows else "(no channels)"))
+
+    text = "\n\n".join(blocks)
+    # Telegram caps a message at 4096 characters; send in parts if needed.
+    chunk = ""
+    for block in text.split("\n\n"):
+        if len(chunk) + len(block) + 2 > 3900:
+            await update.effective_message.reply_text(chunk)
+            chunk = ""
+        chunk += ("\n\n" if chunk else "") + block
+    if chunk:
+        await update.effective_message.reply_text(chunk)
+
+
+@auth.admin_only
 async def toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     a = _args(update)
     if not a:
