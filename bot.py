@@ -4,6 +4,7 @@ import logging
 import traceback
 
 from telegram import Update
+from telegram.error import BadRequest
 from telegram.constants import ChatMemberStatus  # noqa: F401  (kept for clarity)
 from telegram.ext import (
     Application,
@@ -31,7 +32,13 @@ log = logging.getLogger("broadcast-bot")
 
 async def on_error(update: object, context) -> None:
     """Log the traceback and DM it to the admins, so failures are never silent."""
-    log.error("Unhandled exception", exc_info=context.error)
+    err = context.error
+    # A double-tapped button asks Telegram to re-apply an edit that's already
+    # there. Harmless — the first tap did the work — so don't page anyone.
+    if isinstance(err, BadRequest) and "message is not modified" in str(err).lower():
+        log.debug("Ignored duplicate edit (double tap)")
+        return
+    log.error("Unhandled exception", exc_info=err)
     tb = "".join(traceback.format_exception(None, context.error,
                                             context.error.__traceback__))[-1500:]
     text = f"⚠️ Bot error\n\n<pre>{html.escape(tb)}</pre>"
@@ -61,6 +68,7 @@ def build() -> Application:
     app.add_handler(CommandHandler("scheduled", bh.scheduled))
     app.add_handler(CommandHandler("help", bh.help_cmd))
     app.add_handler(CommandHandler("whoami", ah.whoami))
+    app.add_handler(CommandHandler("groups", ah.groups))
 
     # --- admin ---
     app.add_handler(CommandHandler("addchannel", ah.addchannel))
@@ -71,13 +79,13 @@ def build() -> Application:
     app.add_handler(CommandHandler("setdm", ah.setdm))
     app.add_handler(CommandHandler("addgroup", ah.addgroup))
     app.add_handler(CommandHandler("delgroup", ah.delgroup))
-    app.add_handler(CommandHandler("groups", ah.groups))
     app.add_handler(CommandHandler("assign", ah.assign))
     app.add_handler(CommandHandler("unassign", ah.unassign))
     app.add_handler(CommandHandler("adduser", ah.adduser))
     app.add_handler(CommandHandler("deluser", ah.deluser))
     app.add_handler(CommandHandler("users", ah.users))
     app.add_handler(CommandHandler("log", ah.log_cmd))
+    app.add_handler(CommandHandler("import", ah.import_cmd))
 
     app.add_handler(CallbackQueryHandler(bh.on_callback))
 
