@@ -86,6 +86,7 @@ def build() -> Application:
     app.add_handler(CommandHandler("users", ah.users))
     app.add_handler(CommandHandler("log", ah.log_cmd))
     app.add_handler(CommandHandler("import", ah.import_cmd))
+    app.add_handler(CommandHandler("links", ah.links))
 
     app.add_handler(CallbackQueryHandler(bh.on_callback))
 
