@@ -20,6 +20,14 @@ def _args(update: Update) -> list[str]:
     return [p.strip() for p in rest.split("|")]
 
 
+def _clean_url(raw: str) -> str | None:
+    """Strip wrapper characters that survive copy-paste, then validate."""
+    u = (raw or "").strip().strip("<>[](){}\"'` ")
+    if not u or " " in u or not u.lower().startswith(("https://", "http://", "tg://")):
+        return None
+    return u
+
+
 def _ids(blob: str) -> list[int]:
     out = []
     for part in blob.replace(",", " ").split():
@@ -74,8 +82,14 @@ async def setaff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except ValueError:
         await update.effective_message.reply_text("chat_id must be a number.")
         return
+    url = _clean_url(a[1])
+    if not url:
+        await update.effective_message.reply_text(
+            f"That doesn't look like a valid URL:\n{a[1]}\n\n"
+            "Paste it bare — no < >, no [ ], must start with https://")
+        return
     text = a[2] if len(a) > 2 else None
-    if db.set_affiliate(chat_id, a[1], text):
+    if db.set_affiliate(chat_id, url, text):
         ch = db.get_channel(chat_id)
         await update.effective_message.reply_text(
             f"{ch['title']}\nAffiliate button: [{ch['affiliate_text']}] → {ch['affiliate_url']}")
@@ -95,8 +109,14 @@ async def setdm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except ValueError:
         await update.effective_message.reply_text("chat_id must be a number.")
         return
+    url = _clean_url(a[1])
+    if not url:
+        await update.effective_message.reply_text(
+            f"That doesn't look like a valid URL:\n{a[1]}\n\n"
+            "Paste it bare — no < >, no [ ], must start with https://")
+        return
     text = a[2] if len(a) > 2 else None
-    if db.set_dm(chat_id, a[1], text):
+    if db.set_dm(chat_id, url, text):
         ch = db.get_channel(chat_id)
         await update.effective_message.reply_text(
             f"{ch['title']}\nDM button: [{ch['dm_text']}] → {ch['dm_url']}")
@@ -180,26 +200,57 @@ async def addgroup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             order = int(a[1])
         except ValueError:
             pass
+    existing = db.get_group_by_name(a[0])
+    if existing:
+        await update.effective_message.reply_text(
+            f"'{existing['name']}' already exists "
+            f"({len(db.channels_in_group(existing['group_id']))} channels). "
+            f"Names are case-insensitive.\n\nSee them all: /groups")
+        return
+
+    near = db.similar_groups(a[0])
+    forced = len(a) > 2 and a[2].lower() == "confirm"
+    if near and not forced:
+        await update.effective_message.reply_text(
+            f"⚠️ '{a[0]}' looks close to: {', '.join(near)}\n\n"
+            f"Did you mean one of those? Check with /groups.\n"
+            f"To create it anyway:\n/addgroup {a[0]} | {order} | confirm")
+        return
+
     gid = db.add_group(a[0], order)
     if gid is None:
-        await update.effective_message.reply_text("A group with that name exists.")
-    else:
-        await update.effective_message.reply_text(
-            f"Group '{a[0]}' created.\nAdd channels: /assign {a[0]} | -100..., -100...")
+        await update.effective_message.reply_text("Could not create that group.")
+        return
+    await update.effective_message.reply_text(
+        f"Group '{a[0]}' created.\nAdd channels: /assign {a[0]} | -100..., -100...")
 
 
-@auth.admin_only
+@auth.operator_only
 async def groups(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Readable by anyone who can broadcast — you cannot pick a group you
+    cannot see, and not seeing them is how duplicates get created."""
     rows = db.list_groups()
     if not rows:
-        await update.effective_message.reply_text("No groups yet. Use /addgroup.")
+        await update.effective_message.reply_text(
+            "No groups yet."
+            + (" Create one: /addgroup <name>"
+               if auth.is_admin(update.effective_user.id) else ""))
         return
+
     lines = []
     for g in rows:
         members = db.channels_in_group(g["group_id"])
         names = "\n".join(f"   • {m['title']}" for m in members) or "   (empty)"
         lines.append(f"{g['name']}  ({len(members)} active)\n{names}")
-    await update.effective_message.reply_text("\n\n".join(lines))
+
+    total = len(db.list_channels(only_active=True))
+    ungrouped = [c["title"] for c in db.list_channels(only_active=True)
+                 if not db.groups_for_channel(c["chat_id"])]
+    text = f"🗂 {len(rows)} groups · {total} active channels\n\n" + "\n\n".join(lines)
+    if ungrouped:
+        text += ("\n\n⚠️ In no group (unreachable unless picked manually):\n"
+                 + "\n".join(f"   • {t}" for t in ungrouped))
+    await update.effective_message.reply_text(text)
 
 
 @auth.admin_only
@@ -316,6 +367,93 @@ async def log_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append(f"#{b['broadcast_id']} {stamp}  {who['name'] if who else b['user_id']}"
                      f"  → {target}  ({b['n_sent']} sent){undone}")
     await update.effective_message.reply_text("\n".join(lines))
+
+
+@auth.admin_only
+async def import_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Bulk setup from a pasted block. Idempotent — safe to re-send."""
+    text = update.effective_message.text or ""
+    body = text.split("\n", 1)[1] if "\n" in text else ""
+    if not body.strip():
+        await update.effective_message.reply_text(
+            "Paste an import block after /import, one item per line:\n\n"
+            "CHANNEL | chat_id | title | lang | aff_url | aff_text | dm_url | dm_text\n"
+            "GROUP | name | sort_order\n"
+            "MEMBER | group name | chat_id\n\n"
+            "Generate it from your old database with:\n"
+            "python export_config.py\n\n"
+            "Re-sending the same block is safe — it updates rather than duplicates.")
+        return
+
+    counts = {"channel": 0, "group": 0, "member": 0, "user": 0}
+    errors: list[str] = []
+
+    for n, raw in enumerate(body.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = [p.strip() for p in line.split("|")]
+        kind = parts[0].upper()
+
+        try:
+            if kind == "CHANNEL":
+                chat_id = int(parts[1])
+                db.upsert_channel(chat_id, parts[2] or str(chat_id),
+                                  parts[3] or None)
+                aff = _clean_url(parts[4]) if len(parts) > 4 and parts[4] else None
+                if len(parts) > 4 and parts[4] and not aff:
+                    errors.append(f"line {n}: bad affiliate URL, skipped")
+                elif aff:
+                    db.set_affiliate(chat_id, aff,
+                                     parts[5] if len(parts) > 5 and parts[5] else None)
+                dm = _clean_url(parts[6]) if len(parts) > 6 and parts[6] else None
+                if len(parts) > 6 and parts[6] and not dm:
+                    errors.append(f"line {n}: bad DM URL, skipped")
+                elif dm:
+                    db.set_dm(chat_id, dm,
+                              parts[7] if len(parts) > 7 and parts[7] else None)
+                counts["channel"] += 1
+
+            elif kind == "GROUP":
+                order = int(parts[2]) if len(parts) > 2 and parts[2] else 0
+                if db.get_group_by_name(parts[1]) is None:
+                    db.add_group(parts[1], order)
+                counts["group"] += 1
+
+            elif kind == "MEMBER":
+                g = db.get_group_by_name(parts[1])
+                if not g:
+                    errors.append(f"line {n}: no group '{parts[1]}'")
+                    continue
+                chat_id = int(parts[2])
+                if not db.get_channel(chat_id):
+                    errors.append(f"line {n}: channel {chat_id} not added yet")
+                    continue
+                db.assign(g["group_id"], [chat_id])
+                counts["member"] += 1
+
+            elif kind == "USER":
+                role = parts[3] if len(parts) > 3 and parts[3] in ("admin", "operator") \
+                    else "operator"
+                db.add_user(int(parts[1]), parts[2], role)
+                counts["user"] += 1
+
+            else:
+                errors.append(f"line {n}: unknown type '{parts[0]}'")
+
+        except (IndexError, ValueError) as e:
+            errors.append(f"line {n}: {e}")
+
+    msg = (f"✅ Import done\n"
+           f"{counts['channel']} channels · {counts['group']} groups · "
+           f"{counts['member']} assignments"
+           + (f" · {counts['user']} users" if counts["user"] else ""))
+    if errors:
+        msg += "\n\n⚠️ " + "\n⚠️ ".join(errors[:15])
+        if len(errors) > 15:
+            msg += f"\n… and {len(errors) - 15} more"
+    msg += "\n\nCheck it with /channels and /groups."
+    await update.effective_message.reply_text(msg)
 
 
 # ------------------------------------------- auto-registration of channels
